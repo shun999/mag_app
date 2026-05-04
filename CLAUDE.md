@@ -16,15 +16,40 @@ AWS EC2のインスタンスタイプは、t3.microです。
 
 ## Architecture
 
-- **Root level**: Python project managed by `uv` (Python 3.13, see `pyproject.toml` and `.python-version`). 
-- **`backend/`**: Self-contained FastAPI service deployable via Docker to AWS EC2.
-  - `app.py` — Single-file API. On startup (lifespan), downloads ONNX model and stats from S3. Exposes `/health` (GET) and `/anomaly-score` (POST, accepts image upload).
-  - Anomaly detection pipeline: image preprocessing (PIL) → ONNX inference (onnxruntime) → compute MSE, SSIM (scipy gaussian_filter), Mahalanobis distance → normalize using pre-computed stats → ensemble score → threshold comparison.
-  - Model and detection stats (latent_mean, inv_cov, mse/ssim/mahal mean/std, ensemble_threshold) are loaded from `.npz` file.
+- **Root level**: Python project managed by `uv` (Python 3.13, see `pyproject.toml` and `.python-version`).
+- **`backend/`**: FastAPI service deployable via Docker to AWS EC2 (t3.micro).
+  - `app.py` — メインAPI。起動時にS3からONNXモデルをダウンロードし、PostgreSQLテーブルを初期化する。
+  - `database.py` — SQLAlchemy asyncモデル定義 (inspectionsテーブル)、DB接続管理。
+  - エンドポイント: `/health`, `/anomaly-score` (推論), `/inspections` (履歴CRUD), `/inspections/{id}/image` (プリサインドURL)
+  - 推論パイプライン: 画像前処理(PIL) → ONNX推論 → MSE, SSIM, Mahalanobis距離 → 正規化 → ensemble score → 閾値判定
+  - 判定画像はS3 (`inspections/` prefix)、メタデータはPostgreSQLに保存。
+- **`frontend/`**: Flutter (Dart) Android アプリ。パッケージ名: `com.toyota.ingot_inspector`
+  - 4画面構成: カメラ撮影 → 判定結果 → 履歴一覧 → 設定
+  - `lib/services/api_service.dart` — バックエンドAPIとの通信
+  - `lib/config/api_config.dart` — APIサーバーURL管理 (SharedPreferences)
+
+## Commands
+
+### Backend (Docker)
+```bash
+cd backend
+docker compose up --build        # API + PostgreSQL 起動
+docker compose down              # 停止
+```
+
+### Frontend (Flutter)
+```bash
+cd frontend
+flutter pub get                  # 依存取得
+flutter run                      # 実機/エミュレータで実行
+dart analyze lib/                # 静的解析
+```
 
 ## Key Details
 
-- The backend Dockerfile uses Python 3.11-slim (distinct from the root project's Python 3.13).
-- ONNX model session and detection stats are cached via `@lru_cache` — loaded once per process.
-- Default input image size is 64x64; the `/anomaly-score` endpoint accepts an `image_size` query parameter to override.
-- All code comments and docstrings are in Japanese.
+- バックエンドDockerfileはPython 3.11-slim (ルートの3.13とは異なる)。
+- ONNXモデルセッションと統計量は `@lru_cache` でキャッシュ — プロセス起動時に1度だけ読み込み。
+- デフォルト入力画像サイズは64x64。`/anomaly-score` の `image_size` パラメータで変更可能。
+- `backend/.env.example` に全環境変数のテンプレートあり。本番ではRDS接続文字列を `DATABASE_URL` に設定。
+- Flutter側のAPIサーバーURLはアプリ内の設定画面から変更可能 (デフォルト: EC2のIP)。
+- コメント・docstringは日本語。

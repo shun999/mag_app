@@ -1,21 +1,30 @@
 """
 ONNX版AutoEncoder異常検知API (AWS EC2デプロイ用)
-起動時に S3 からモデルファイルをダウンロードする。
+起動時に S3 からモデルファイルをダウンロードし、
+判定履歴を PostgreSQL + S3 に保存する。
 """
 
 import os
+import time
+import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
 import boto3
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from PIL import Image
 from scipy.ndimage import gaussian_filter
+from sqlalchemy import desc, select
+from sqlalchemy.ext.asyncio import AsyncSession
 import onnxruntime as ort
+
+from database import Inspection, get_db, init_db
 
 
 # ============================================================
@@ -54,10 +63,18 @@ def _download_from_s3():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     _download_from_s3()
+    await init_db()
     yield
 
 
 app = FastAPI(title="AutoEncoder Anomaly Detection API", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 # ============================================================
@@ -174,7 +191,10 @@ async def anomaly_score(
     # 推論
     file_bytes = await file.read()
     input_tensor = _load_image(file_bytes, (image_size, image_size))
+
+    t0 = time.perf_counter()
     reconstructed, latent = session.run(output_names, {input_name: input_tensor})
+    inference_time_ms = int((time.perf_counter() - t0) * 1000)
 
     # 各指標を計算
     mse = float(np.mean((reconstructed - input_tensor) ** 2))
@@ -199,7 +219,136 @@ async def anomaly_score(
         "reconstruction_error": mse,
         "ssim_score": ssim_val,
         "mahalanobis_distance": mahal_dist,
+        "inference_time_ms": inference_time_ms,
         "latent_vector": latent[0].tolist(),
     }
 
     return JSONResponse(content=response)
+
+
+# ============================================================
+# 判定履歴エンドポイント
+# ============================================================
+S3_INSPECTION_PREFIX = os.environ.get("S3_INSPECTION_PREFIX", "inspections/")
+
+
+@app.post("/inspections")
+async def create_inspection(
+    file: UploadFile = File(...),
+    filename: str = Form(...),
+    ensemble_score: float = Form(...),
+    is_anomaly: bool = Form(...),
+    threshold: float = Form(...),
+    reconstruction_error: float = Form(...),
+    ssim_score: float = Form(...),
+    mahalanobis_distance: float = Form(...),
+    inference_time_ms: int = Form(...),
+    db: AsyncSession = Depends(get_db),
+):
+    """判定結果と画像を保存する。"""
+    inspection_id = str(uuid.uuid4())
+    s3_key = f"{S3_INSPECTION_PREFIX}{inspection_id}.jpg"
+
+    # 画像を S3 にアップロード
+    file_bytes = await file.read()
+    s3 = boto3.client("s3")
+    s3.upload_fileobj(
+        BytesIO(file_bytes),
+        S3_BUCKET,
+        s3_key,
+        ExtraArgs={"ContentType": file.content_type or "image/jpeg"},
+    )
+
+    inspection = Inspection(
+        id=inspection_id,
+        image_s3_key=s3_key,
+        filename=filename,
+        ensemble_score=ensemble_score,
+        is_anomaly=is_anomaly,
+        threshold=threshold,
+        reconstruction_error=reconstruction_error,
+        ssim_score=ssim_score,
+        mahalanobis_distance=mahalanobis_distance,
+        inference_time_ms=inference_time_ms,
+    )
+    db.add(inspection)
+    await db.commit()
+    await db.refresh(inspection)
+
+    return {
+        "id": inspection.id,
+        "filename": inspection.filename,
+        "is_anomaly": inspection.is_anomaly,
+        "ensemble_score": inspection.ensemble_score,
+        "created_at": inspection.created_at.isoformat(),
+    }
+
+
+@app.get("/inspections")
+async def list_inspections(
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+    days: int = Query(default=7, ge=1, le=365),
+    db: AsyncSession = Depends(get_db),
+):
+    """判定履歴の一覧を取得する。"""
+    JST = timezone(timedelta(hours=9))
+    since = datetime.now(JST) - timedelta(days=days)
+
+    query = (
+        select(Inspection)
+        .where(Inspection.created_at >= since)
+        .order_by(desc(Inspection.created_at))
+        .offset(offset)
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    rows = result.scalars().all()
+
+    count_query = (
+        select(Inspection.id)
+        .where(Inspection.created_at >= since)
+    )
+    count_result = await db.execute(count_query)
+    total = len(count_result.all())
+
+    return {
+        "total": total,
+        "items": [
+            {
+                "id": r.id,
+                "filename": r.filename,
+                "ensemble_score": r.ensemble_score,
+                "is_anomaly": r.is_anomaly,
+                "threshold": r.threshold,
+                "reconstruction_error": r.reconstruction_error,
+                "ssim_score": r.ssim_score,
+                "mahalanobis_distance": r.mahalanobis_distance,
+                "inference_time_ms": r.inference_time_ms,
+                "created_at": r.created_at.isoformat(),
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/inspections/{inspection_id}/image")
+async def get_inspection_image(
+    inspection_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """判定画像のプリサインドURLを返す。"""
+    result = await db.execute(
+        select(Inspection).where(Inspection.id == inspection_id)
+    )
+    inspection = result.scalar_one_or_none()
+    if not inspection:
+        raise HTTPException(status_code=404, detail="Inspection not found")
+
+    s3 = boto3.client("s3")
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": S3_BUCKET, "Key": inspection.image_s3_key},
+        ExpiresIn=3600,
+    )
+    return {"url": url}
