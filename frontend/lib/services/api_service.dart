@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 
 import '../config/api_config.dart';
 import '../models/anomaly_result.dart';
@@ -14,7 +15,11 @@ class ApiService {
     final uri = Uri.parse('$baseUrl/anomaly-score');
 
     final request = http.MultipartRequest('POST', uri)
-      ..files.add(await http.MultipartFile.fromPath('file', imageFile.path));
+      ..files.add(await http.MultipartFile.fromPath(
+        'file',
+        imageFile.path,
+        contentType: MediaType('image', 'jpeg'),
+      ));
 
     final streamed = await request.send();
     if (streamed.statusCode != 200) {
@@ -35,7 +40,11 @@ class ApiService {
     final uri = Uri.parse('$baseUrl/inspections');
 
     final request = http.MultipartRequest('POST', uri)
-      ..files.add(await http.MultipartFile.fromPath('file', imageFile.path))
+      ..files.add(await http.MultipartFile.fromPath(
+        'file',
+        imageFile.path,
+        contentType: MediaType('image', 'jpeg'),
+      ))
       ..fields['filename'] = filename
       ..fields['ensemble_score'] = result.ensembleScore.toString()
       ..fields['is_anomaly'] = result.isAnomaly.toString()

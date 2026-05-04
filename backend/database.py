@@ -36,7 +36,7 @@ class Inspection(Base):
     ssim_score = Column(Float, nullable=False)
     mahalanobis_distance = Column(Float, nullable=False)
     inference_time_ms = Column(Integer, nullable=False)
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
 async def init_db():
