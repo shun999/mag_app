@@ -35,6 +35,7 @@ S3_MODEL_KEY = os.environ.get("S3_MODEL_KEY", "models/best_model.onnx")
 S3_STATS_KEY = os.environ.get("S3_STATS_KEY", "models/detection_stats.npz")
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", "/app/models"))
 DEFAULT_IMAGE_SIZE = (64, 64)
+ENSEMBLE_THRESHOLD_OVERRIDE = os.environ.get("ENSEMBLE_THRESHOLD")
 
 MODEL_PATH = MODEL_DIR / "best_model.onnx"
 STATS_PATH = MODEL_DIR / "detection_stats.npz"
@@ -210,7 +211,11 @@ async def anomaly_score(
     norm_mahal = (mahal_dist - float(stats['mahal_mean'])) / (float(stats['mahal_std']) + eps)
     ensemble_score = (norm_mse + norm_ssim + norm_mahal) / 3.0
 
-    threshold = float(stats['ensemble_threshold'])
+    threshold = (
+        float(ENSEMBLE_THRESHOLD_OVERRIDE)
+        if ENSEMBLE_THRESHOLD_OVERRIDE is not None
+        else float(stats['ensemble_threshold'])
+    )
 
     response = {
         "ensemble_score": ensemble_score,
